@@ -68,8 +68,6 @@ class Frame(BaseModel):
     image: str
 
 
-class CalibrateRequest(BaseModel):
-    session_id: str
 
 
 def bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
@@ -243,7 +241,7 @@ def update_item(item_id: int, item: Item):
     return {"item_name": item.name, "item_id": item_id}
 
 
-@app.websocket("/ws/predict")
+@app.websocket("/ws/gaze")
 async def websocket_predict(websocket: WebSocket):
     """Stream prediction frames over WebSocket with optional session personalization."""
     await websocket.accept()
@@ -294,7 +292,7 @@ async def websocket_predict(websocket: WebSocket):
         print("WebSocket /ws/predict error:", exc)
 
 
-@app.websocket("/ws/calibrate")
+@app.websocket("/ws/calibration")
 async def websocket_calibrate(websocket: WebSocket):
     """Stream calibration frames and stage accepted eye crops locally per label."""
     await websocket.accept()
@@ -393,26 +391,26 @@ async def websocket_calibrate(websocket: WebSocket):
         print("WebSocket /ws/calibrate error:", exc)
 
 
-@app.post("/model/calibrate")
-def calibrate_v2(req: CalibrateRequest):
+@app.post("/sessions/{session_id}/calibration")
+def calibrate_v2(session_id: str):
     """Finalize calibration from staged local crops and persist the new session model."""
     try:
-        calibration_crops, crops_to_upload = load_local_calibration_crops(req.session_id)
+        calibration_crops, crops_to_upload = load_local_calibration_crops(session_id)
         _, result, ridge_clf = calibrate_user(
             calibration_crops,
             crops_to_upload,
-            session_id=req.session_id,
+            session_id=session_id,
             manifest=load_manifest(),
         )
-        _cache_ridge_model(req.session_id, ridge_clf)
+        _cache_ridge_model(session_id, ridge_clf)
         return result
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
-        print(f"Cleaning up local calibration data for session %s", req.session_id)
-        cleanup_local_calibration_data(req.session_id)
+        print(f"Cleaning up local calibration data for session %s", session_id)
+        cleanup_local_calibration_data(session_id)
 
 
 @app.get("/health")

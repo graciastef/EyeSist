@@ -122,7 +122,8 @@ const connectWebSocket = () => {
     return Promise.resolve();
   }
 
-  socket = new WebSocket("ws://localhost:8000/ws/predict");
+  const wsBase = import.meta.env.VITE_API_BASE_URL.replace(/^http/, "ws");
+  socket = new WebSocket(`${wsBase}/ws/gaze`);
   socket.binaryType = "arraybuffer";
 
   return new Promise((resolve, reject) => {

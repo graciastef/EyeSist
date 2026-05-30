@@ -172,7 +172,8 @@ const captureCurrentLabel = async () => {
   captureCount.value = 0;
   statusMessage.value = `Connecting for ${displayLabel}...`;
 
-  const socket = new WebSocket("ws://localhost:8000/ws/calibrate");
+  const wsBase = import.meta.env.VITE_API_BASE_URL.replace(/^http/, "ws");
+  const socket = new WebSocket(`${wsBase}/ws/calibration`);
   socket.binaryType = "arraybuffer";
 
   try {
@@ -252,10 +253,8 @@ const finishCalibration = async () => {
   statusMessage.value = "Training personalized model...";
 
   try {
-    const response = await fetch("http://localhost:8000/model/calibrate", {
+    const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/sessions/${sessionId}/calibration`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId }),
     });
 
     const data = await response.json();

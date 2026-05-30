@@ -1,30 +1,168 @@
 # EyeSist
 
-Eye gaze classification system with per-user Ridge Regression calibration and an automated MLOps retraining pipeline.
+**A real-time, gaze-controlled communication aid for people with motor disabilities.**
 
-## Architecture overview
+EyeSist lets users type, autocomplete words, and have text spoken aloud — all by looking at a screen. A webcam streams to a FastAPI server that detects eyes with a custom YOLO model, classifies gaze direction (left/right/up/down/straight/closed) using a fine-tuned ResNet-50, and returns results over WebSocket fast enough to drive a keyboard interface in real time. Users personalise the system with a 30-second calibration that fits a per-user Ridge Regression model on top of the shared backbone — no retraining required.
+
+A ClearML MLOps pipeline runs in the background: it accumulates calibration data from users whose eyes the base model struggles with, retrains three candidate architectures in parallel, evaluates them against the production model, and promotes the winner only if it clears a statistical improvement bar.
+
+## Key Features
+
+- **Real-time gaze inference** over WebSocket — per-frame request/response loop with 8-frame majority-vote smoothing
+- **Gaze-directed keyboard** — QWERTY and Nokia T9 layouts; navigate by looking up/down/left/right, activate by looking straight
+- **Instant personalisation** — Ridge Regression classifier fit on backbone features in under 1 second; immediately active for that session and persisted so returning users can skip calibration
+- **Automatic TTS** — Web Speech API, no external service
+- **Prefix autocomplete** — client-side, zero-latency, works offline
+- **Full MLOps pipeline** — volume-triggered retraining, parallel candidate training, promotion gate, versioned model storage
+
+---
+
+## Demo
+
+[![EyeSist Demo](assets/eyesist_demo.png)](https://www.youtube.com/watch?v=mq-nGi2ElHg&t=126)
+
+---
+
+## System Architecture
 
 ```
-Backend
-  └─ YOLO eye detection → crop eyes
-  └─ POST /calibrate  → per-user Ridge Regression (fitted in ~40ms)
-  └─ POST /predict    → gaze direction (6 classes: closed, down, left, right, straight, up)
-
-Azure Blob Storage ("eyesist" container)
-  ├─ calibration-data/{session_id}/images/{label}_{n}.jpg
-  ├─ calibration-data/{session_id}/meta.json
-  ├─ models/backbone/ethxgaze_backbone.pth          ← production model
-  ├─ models/backbone/candidate/ethxgaze_candidate_*.pth
-  ├─ models/backbone/archive/ethxgaze_backbone_*.pth
-  └─ models/backbone/promotion_log.json
-
-ClearML (nightly at 2am UTC)
-  └─ pipeline: check_retrain → train_model → evaluate_promote
+┌─────────────────────────────────┐        WebSocket (binary frames)
+│  Browser (Vue 3)                │ ──────────────────────────────────►  ┌──────────────────────────────────────┐
+│  ├─ Camera.vue (webcam stream)  │                                       │  FastAPI Backend                     │
+│  ├─ Keyboard.vue (gaze nav)     │ ◄──────────────────────────────────   │  ├─ YOLO eye detector                │
+│  ├─ CalibrationModal.vue        │        JSON {gaze, boxes}             │  ├─ ETH-XGaze ResNet-50 backbone      │
+│  └─ Web Speech API (TTS)        │                                       │  ├─ Per-session Ridge classifier      │
+└─────────────────────────────────┘                                       │  └─ 8-frame majority-vote smoother   │
+                                                                          └──────────────┬───────────────────────┘
+                                                                                         │
+                                                              ┌──────────────────────────▼──────────────────────────┐
+                                                              │  Azure Blob Storage                                  │
+                                                              │  ├─ models/backbone/ethxgaze_backbone.pth (prod)     │
+                                                              │  ├─ models/backbone/promoted/ethxgaze_v{N}_*.pth    │
+                                                              │  ├─ models/ridge/{session_id}.pkl                   │
+                                                              │  ├─ calibration-data/{session_id}/{label}/*.jpg     │
+                                                              │  ├─ dataset/manifest.json                           │
+                                                              │  └─ dataset/last_retrain.json                       │
+                                                              └──────────────┬──────────────────────────────────────┘
+                                                                             │
+                                                              ┌──────────────▼──────────────────────────────────────┐
+                                                              │  ClearML Retraining Pipeline (SageMaker)            │
+                                                              │  check_retrain → ingest_data                        │
+                                                              │    → [train_resnet50 ║ train_mobilenet              │
+                                                              │       ║ train_efficientnet] (parallel)              │
+                                                              │    → eval_model → get_test_result                   │
+                                                              │    → evaluate_promotion → upload_promoted           │
+                                                              └─────────────────────────────────────────────────────┘
 ```
 
-## Backend
+---
 
-### Setup
+## ML / AI Components
+
+### Eye Detection
+
+A custom-trained YOLO model (`yolo26_eye_detector.pt`, via Ultralytics) detects and crops eye regions from each webcam frame. Using a dedicated eye detector rather than a face landmark approach gives tighter crops and handles partial occlusion better.
+
+### Gaze Classification
+
+**Backbone:** ETH-XGaze pretrained ResNet-50, repurposed as a 2048-dimensional feature extractor (the original `fc` layer is never called). Fine-tuned end-to-end on 6 gaze classes: `closed · down · left · right · straight · up`.
+
+**Training regime:** Two-phase fine-tuning —
+- Phase 1: backbone frozen, classification head trained from scratch
+- Phase 2: backbone unfrozen from a specified layer, differential learning rates (backbone LR = head LR × 0.1), early stopping, ReduceLROnPlateau
+
+### Per-User Personalisation (Ridge Calibration)
+
+During calibration (~100 eye crops per direction), backbone features are extracted and a `RidgeClassifier` + `StandardScaler` scikit-learn pipeline is fitted in under 1 second. This model is stored per session in Azure and loaded on cache miss. Users whose base model accuracy is already ≥ 90% skip image upload — their data adds no training diversity.
+
+---
+
+## MLOps Pipeline
+
+The retraining pipeline runs on ClearML-managed SageMaker agents and is triggered when 5,000+ new training samples have accumulated since the last retrain (from users whose base accuracy was < 90%).
+
+### Pipeline DAG
+
+```
+check_retrain
+     │
+ingest_data  ──── logs original + user dataset counts to ClearML
+     │
+     ├──── train_resnet50     ─┐
+     ├──── train_mobilenet    ─┼── parallel, each with 2-phase fine-tuning
+     └──── train_efficientnet ─┘
+                │
+           eval_model  ──── picks winner by validation accuracy
+                │            logs FPS + confusion matrix per candidate
+         get_test_result ── evaluates winner on held-out test set
+                │
+      evaluate_promotion ── compares winner vs current production model
+                │            promotes only if delta ≥ 2% absolute accuracy
+         upload_promoted ── versions model in Azure, updates manifest
+```
+
+### Data Strategy
+
+- **Original dataset** — fixed train/val/test splits, never reassigned
+- **User sessions** — assigned to train/val/test at ingestion using a greedy deficit-balancing algorithm (targets: 70/15/15) based on both session count and sample count
+- **Expanding window** — all qualifying sessions since system launch are included in each retrain; the trigger counts new samples since the last run
+
+### Experiment Tracking
+
+Every calibration session creates a ClearML task logging `base_accuracy`, `ridge_accuracy`, and per-label sample counts. Pipeline runs log training curves, per-candidate validation accuracy, inference FPS, and confusion matrices. Promoted models are archived with version number, timestamp, and test accuracy delta.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | Vue 3, Vite |
+| Backend | Python 3.12, FastAPI, Uvicorn |
+| ML framework | PyTorch 2.11, Torchvision |
+| Eye detection | Ultralytics YOLO (custom weights) |
+| Personalisation | scikit-learn RidgeClassifier |
+| MLOps | ClearML Pipelines |
+| Cloud storage | Azure Blob Storage |
+| Inference host | Amazon SageMaker |
+| TTS | Web Speech API (browser-native) |
+
+---
+
+## Project Structure
+
+```
+backend/
+├── main.py                  # FastAPI app — WebSocket predict & calibrate endpoints
+├── model.py                 # GazeClassifier, ResNet-50, feature extraction, inference
+├── eye_detector.py          # YOLO-based eye detection and cropping
+├── azure_storage.py         # Azure Blob Storage helpers (models, manifests, sessions)
+├── pipeline_helpers.py      # Shared training/eval code imported by pipeline steps
+├── runtime_config.py        # Device selection (auto / cpu / cuda / mps)
+├── training_config.py       # Hyperparameters, model configs, retrain thresholds
+├── requirements.txt
+└── pipeline/
+    ├── pipeline_controller.py   # ClearML PipelineDecorator — step definitions + DAG
+    └── step_calibrate_user.py   # Ridge calibration, split assignment, data upload
+
+frontend/
+├── src/
+│   ├── components/
+│   │   ├── Camera.vue           # Webcam capture + WebSocket streaming
+│   │   ├── Keyboard.vue         # Gaze-navigable keyboard (QWERTY + Nokia T9)
+│   │   ├── CalibrationModal.vue # Per-label calibration capture flow
+│   │   └── TextOutput.vue       # Composed text display
+│   └── store/
+│       ├── keyboardText.js      # Text state + Nokia multi-tap logic
+│       └── dictionary.js        # Static word list for prefix autocomplete
+└── package.json
+```
+
+---
+
+## Local Setup
+
+### Backend
 
 ```bash
 cd backend
@@ -33,132 +171,46 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Set environment variables:
+Create a `.env` file in `backend/`:
 
-| Variable | Default | Description |
-|---|---|---|
-| `AZURE_STORAGE_ACCOUNT_NAME` | `anonifyme` | Azure storage account |
-| `EYESIST_DEVICE` | `auto` | PyTorch device: `auto`, `cpu`, `cuda`, `mps` |
-
-### Run
+```env
+AZURE_STORAGE_ACCOUNT_NAME=your_account_name
+EYESIST_DEVICE=auto          # auto | cpu | cuda | mps
+```
 
 ```bash
 uvicorn main:app --reload
 ```
 
-### API endpoints
+### Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+### Retraining Pipeline
+
+```bash
+# Run all pipeline steps locally (subprocess isolation, matches ClearML behaviour)
+cd backend/pipeline
+python pipeline_controller.py --run-local
+
+# Force a run regardless of sample threshold
+python pipeline_controller.py --run-local --force
+
+# Dispatch to ClearML agents
+python pipeline_controller.py --run-now
+```
+
+---
+
+## API Reference
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/calibrate` | Fit per-user Ridge model. Body: `{crops: {label: [base64, ...]}}` |
-| `POST` | `/predict` | Predict gaze direction. Body: `{image: base64, session_id?: string}` |
+| `WS` | `/ws/gaze` | Stream frames, receive `{gaze, boxes, frame_size}` per frame |
+| `WS` | `/ws/calibration` | Stream eye crops for one label during calibration |
+| `POST` | `/sessions/{session_id}/calibration` | Finalise calibration, fit and store Ridge model |
 | `GET` | `/health` | Health check |
-
-### Model
-
-- **Backbone**: ETH-XGaze pretrained ResNet-50 (outputs 2048-d feature vector, `fc` layer never called)
-- **Head**: configurable dense layers → `Linear(2048, 6)` (best config uses no intermediate layers)
-- **Per-user calibration**: Ridge Regression (`alpha=1.0`, `StandardScaler`, `class_weight="balanced"`) fitted on backbone features — ~40ms fit time
-- **Session storage**: Ridge model saved locally at `/tmp/eyesist_sessions/<uuid>.pkl`; 
-
-## MLOps pipeline
-
-### Overview
-
-Retraining is triggered automatically when the base model's per-session accuracy degrades. It never runs from a user calibration — calibration is always Ridge-only. Retraining rebuilds the full ResNet-50 + head from the current production weights.
-
-### Trigger condition
-
-2 or more user sessions where the base model pre-calibration accuracy falls below 50%.
-
-### Pipeline steps
-
-```
-pipeline_controller.py
-  ├─ step 1: check_retrain
-  │    - Scans all session meta.json in Azure
-  │    - If 2+ sessions below 50%: assigns permanent train/test splits (80/20)
-  │    - Returns (needs_retrain, train_session_ids)
-  │
-  ├─ step 2: train_model  (only runs if needs_retrain=True)
-  │    - Loads production weights from Azure as starting point
-  │    - Combines original TRAIN_DIR + Azure user session images (split=train)
-  │    - Phase 1: freeze backbone, train head only
-  │    - Phase 2: unfreeze from layer3, fine-tune with differential LR
-  │    - Uploads candidate checkpoint to Azure
-  │
-  └─ step 3: evaluate_promote
-       - Evaluates candidate vs production on original TEST_DIR + user test sessions
-       - Promotes if: candidate_test_acc > production_test_acc + 1% AND > 60% floor
-       - Archives old backbone before overwriting production
-       - Logs every promotion decision to models/backbone/promotion_log.json
-```
-
-### Data split strategy
-
-| Data source | Splits |
-|---|---|
-| Original dataset | Fixed `train` / `val` / `test` — never reassigned |
-| User sessions | `train` or `test` only — assigned permanently at first retrain trigger |
-| Val set | Original only — user sessions never go into val |
-
-### Running the pipeline
-
-**Local debug (all steps run in-process):**
-```bash
-cd backend/pipeline
-python pipeline_controller.py --run-local
-```
-
-**Enqueue on ClearML agents:**
-```bash
-python pipeline_controller.py --run-remote
-```
-
-**Register nightly scheduler (run once to activate):**
-```bash
-python pipeline_controller.py --schedule --cron "0 2 * * *"
-```
-
-### ClearML agent setup
-
-Each agent machine needs:
-1. ClearML credentials configured (`clearml-agent init`)
-2. Backend dependencies installed (`pip install -r backend/requirements.txt`)
-3. `EYESIST_BACKEND_DIR` env var pointing to the `backend/` directory
-4. `AZURE_STORAGE_ACCOUNT_NAME` env var set
-5. Agent running in the `default` queue: `clearml-agent daemon --queue default`
-
-### Promotion logic
-
-| Condition | Result |
-|---|---|
-| candidate test acc ≥ production test acc + 5% AND ≥ 60% | Promoted — overwrites production blob, archives old |
-| candidate test acc < production test acc + 5% | Not promoted — not meaningfully better |
-| candidate test acc < 60% | Not promoted — below quality floor |
-
-After promotion the FastAPI server clears its in-memory model singleton and reloads from Azure on the next request.
-
-## Project structure
-
-```
-backend/
-├── main.py                        # FastAPI app
-├── model.py                       # GazeClassifier, ResNet-50, feature extraction
-├── eye_detector.py                # YOLO eye cropping
-├── azure_storage.py               # Azure Blob Storage helpers
-├── runtime_config.py              # Device selection (EYESIST_DEVICE)
-├── training_config.py             # LABELS, RETRAIN_EXPERIMENT_CONFIG, SEED
-├── requirements.txt
-└── pipeline/
-    ├── pipeline_controller.py     # ClearML PipelineDecorator + TaskScheduler
-    ├── step_check_retrain.py      # Check trigger condition, assign splits
-    ├── step_train_base_model.py   # Retrain from production weights
-    └── step_evaluate_promote.py   # Evaluate candidate, promote if better
-
-frontend/
-└── ...
-
-Experiments/
-└── ETHGaze_Transfer_Learning.ipynb  # Original training notebook (reference)
-```

@@ -29,6 +29,7 @@ coverage
 .eslintcache
 
 vue-projeect/*
+.env
 
 # Cypress
 /cypress/videos/
