@@ -17,12 +17,6 @@ A ClearML MLOps pipeline runs in the background: it accumulates calibration data
 
 ---
 
-## Demo
-
-[![EyeSist Demo](assets/eyesist_demo.png)](https://www.youtube.com/watch?v=mq-nGi2ElHg&t=126)
-
----
-
 ## System Architecture
 
 ```
