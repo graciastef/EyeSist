@@ -1,7 +1,9 @@
 from collections import Counter, OrderedDict, deque
 import asyncio
 import base64
+import io
 import json
+import logging
 import os
 import shutil
 from typing import Any
@@ -28,6 +30,8 @@ from pipeline.step_calibrate_user import (
 from runtime_config import get_runtime_device_str
 from training_config import LABELS
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 SMOOTHING_WINDOW = 5
 TARGET_CALIBRATION_IMAGES = 100
@@ -38,29 +42,25 @@ RIDGE_MODEL_CACHE: OrderedDict[str, Any] = OrderedDict()
 
 @app.on_event("startup")
 def log_runtime_device() -> None:
-    print(f"EyeSist backend starting on device: {get_runtime_device_str()}")
+    logger.info("EyeSist backend starting on device: %s", get_runtime_device_str())
     ensure_container()
     from model import MODEL_PATH
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     with open(MODEL_PATH, "wb") as f:
         f.write(download_backbone())
-    print(f"Backbone loaded from Azure → {MODEL_PATH}")
+    logger.info("Backbone loaded from Azure → %s", MODEL_PATH)
 
+
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-
-class Item(BaseModel):
-    name: str
-    price: float
-    is_offer: bool | None = None
 
 
 
@@ -151,7 +151,7 @@ def _cache_ridge_model(session_id: str, ridge_clf: Any) -> Any:
 
 def _load_ridge(session_id: str):
     """Load a session Ridge model from memory first, then Azure on cache miss."""
-    import pickle
+    import joblib
 
     cached_model = RIDGE_MODEL_CACHE.get(session_id)
     if cached_model is not None:
@@ -162,7 +162,7 @@ def _load_ridge(session_id: str):
         raise FileNotFoundError(f"No Ridge model found for session {session_id}")
 
     model_bytes = download_ridge_model(session_id)
-    return _cache_ridge_model(session_id, pickle.loads(model_bytes))
+    return _cache_ridge_model(session_id, joblib.load(io.BytesIO(model_bytes)))
 
 
 def predict_from_eye_crops(eye_crops: list[np.ndarray], session_id: str | None) -> list[str]:
@@ -226,21 +226,6 @@ def collapse_gaze(gaze: list[str], confidences: list[float]) -> str:
     return gaze[best_idx]
 
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
-
-
-@app.get("/items/{item_id}")
-def read_item(item_id: int, q: str | None = None):
-    return {"item_id": item_id, "q": q}
-
-
-@app.put("/items/{item_id}")
-def update_item(item_id: int, item: Item):
-    return {"item_name": item.name, "item_id": item_id}
-
-
 @app.websocket("/ws/gaze")
 async def websocket_predict(websocket: WebSocket):
     """Stream prediction frames over WebSocket with optional session personalization."""
@@ -285,11 +270,11 @@ async def websocket_predict(websocket: WebSocket):
 
             await websocket.send_json({"error": "Unsupported WebSocket payload", "gaze": None})
     except WebSocketDisconnect:
-        print("WebSocket /ws/predict closed")
+        logger.info("WebSocket /ws/gaze closed")
     except json.JSONDecodeError:
         await websocket.send_json({"error": "Invalid JSON payload", "gaze": None})
     except Exception as exc:
-        print("WebSocket /ws/predict error:", exc)
+        logger.exception("WebSocket /ws/gaze error")
 
 
 @app.websocket("/ws/calibration")
@@ -385,10 +370,10 @@ async def websocket_calibrate(websocket: WebSocket):
                 }
             )
     except WebSocketDisconnect:
-        print("WebSocket /ws/calibrate closed")
+        logger.info("WebSocket /ws/calibration closed")
     except Exception as exc:
         await websocket.send_json({"status": "error", "detail": str(exc)})
-        print("WebSocket /ws/calibrate error:", exc)
+        logger.exception("WebSocket /ws/calibration error")
 
 
 @app.post("/sessions/{session_id}/calibration")
@@ -409,7 +394,7 @@ def calibrate_v2(session_id: str):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
-        print(f"Cleaning up local calibration data for session %s", session_id)
+        logger.info("Cleaning up local calibration data for session %s", session_id)
         cleanup_local_calibration_data(session_id)
 
 

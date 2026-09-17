@@ -1,5 +1,5 @@
+import io
 import os
-import pickle
 import shutil
 from datetime import datetime, timezone
 
@@ -161,7 +161,10 @@ def calibrate_user(
     ridge_clf.fit(X, y)
     ridge_accuracy = float(ridge_clf.score(X, y))
 
-    model_bytes = pickle.dumps(ridge_clf)
+    buf = io.BytesIO()
+    import joblib
+    joblib.dump(ridge_clf, buf)
+    model_bytes = buf.getvalue()
     delete_session_images(session_id)
     delete_ridge_model(session_id)
     delete_session_meta(session_id)
