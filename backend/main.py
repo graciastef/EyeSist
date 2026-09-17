@@ -51,7 +51,7 @@ def log_runtime_device() -> None:
     logger.info("Backbone loaded from Azure → %s", MODEL_PATH)
 
 
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
 _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 app.add_middleware(
